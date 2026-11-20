@@ -70,6 +70,16 @@ It can also be set as a regular environment variable. Separate several folders w
 
 After changing the code, a terminal session reloads it when you save; in the desktop app, restart Claude.
 
+## Claude Code CLI (likely works, needs testing)
+
+The mod was built and used in the Claude desktop app. It runs on the same Claude Code engine as the CLI and draws with the terminal's own band and buttons, so it should work in a terminal session as is. So far it's only been tested there in the automated tests. If you try it, these are the differences to expect:
+
+- **Hidden band:** right-click > **Show usage band** is desktop-only. Use `/usage-band` to bring the band back.
+- **Usage pane:** `☰` or `/usage-meter` opens it at any width; the terminal only places it on its own when the window is at least 144 columns wide.
+- **Keep-warm needs the session open.** A CLI chat only runs while its terminal does: close the terminal or end the session and the pings stop. One-shot `claude -p` runs have nothing to keep warm.
+- **Keep-warm needs a 1-hour cache.** It only pings a 1-hour cache, and it hasn't been confirmed whether the CLI uses one on every plan. Open the pane after a reply and check the Cache line: `1-hour cache` means keep-warm will work; `5-minute cache` means Warm shows "waiting for a 1-hour cache" and never pings.
+- **Resumed chats** (`claude --resume`) recover the cache timer from the transcript, as after a restart in the desktop app.
+
 ## Commands
 
 - `/usage-meter`: opens the Usage pane.
