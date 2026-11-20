@@ -1,10 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionContextUsage, SessionRateLimit, TurnUsage } from 'claude-code'
 
-import type { CacheTimer, LastTurn, Limit, Snap, Warm } from '../types'
+import type { CacheTimer, LastTurn, Lim, Limit, Snap, Warm } from '../types'
 
 const snap = atom({ plugin: 'usage-meter', key: 'snap' } as const, null)
 const warm = atom({ plugin: 'usage-meter', key: 'warm' } as const, null)
+const lim = atom({ plugin: 'usage-meter', key: 'lim' } as const, null)
 const band = atom({ plugin: 'usage-meter', key: 'band' } as const, null)
 const paneTick = atom({ plugin: 'usage-meter', key: 'pane' } as const, null)
 
@@ -24,9 +25,19 @@ const KEEP_WARM_SHUTOFF_HOURS = 24
 // How long before the cache expires the ping goes out.
 const WARM_LEAD_MS = 3 * 60 * 1000
 
+// --- lim95 settings -----------------------------------------------------------
+// The 5-hour percent at which Claude is told to pause.
+const LIM_PCT = 95
+// Added to the time left in the 5-hour window for the wait.
+const LIM_PAD_MS = 2 * 60 * 1000
+// How often the 5-hour figure is re-read while lim95 is on (a local read of
+// the engine's latest figure: it costs no usage). Once a minute otherwise.
+const LIM_SYNC_MS = 15_000
+const LIM_LABEL = 'lim95'
+
 // --- Band layout --------------------------------------------------------------
-// Columns kept free for the hide, Warm and pane buttons when fitting the band.
-const BUTTONS_COLS = 24
+// Columns kept free for the hide, Warm, lim95 and pane buttons when fitting the band.
+const BUTTONS_COLS = 32
 // The button that hides the band; right-click > Show usage band, or
 // /usage-band, brings it back.
 const HIDE_LABEL = '▾'
@@ -225,6 +236,8 @@ type StoredLimits = { fiveHour: Limit | null; week: Limit | null; at?: number }
 let limitsAt = 0
 const SYNC_LIMITS_MS = 60_000
 let limitsSyncedAt = 0
+// When the 5-hour figure was last checked, by any route (shown in the pane).
+let fiveCheckedAt: number | null = null
 
 // A limit as it stands at `now`: once its reset time has passed the window has
 // started over, so it reads 0% with no countdown (the next window's clock starts
@@ -300,13 +313,16 @@ async function limitsOrStored(
   return { fiveHour: stored?.fiveHour ?? null, week: stored?.week ?? null }
 }
 
-// Once a minute (and with `force` right before a ping, which records the 5h
-// figure): re-reads the engine's latest reading in case a change slipped by,
-// then takes up a newer one another chat saved, so every chat shows the
-// account's latest numbers without a reply of its own.
+// Once a minute, every 15 seconds while lim95 is on (and with `force` right
+// before a ping, which records the 5h figure): re-reads the engine's latest
+// reading in case a change slipped by, then takes up a newer one another chat
+// saved, so every chat shows the account's latest numbers without a reply of
+// its own. The clock keeps ticking while Claude works, so this runs mid-turn too.
 async function syncLimits($: EngineInterface, now: number, force = false) {
-  if (!force && now - limitsSyncedAt < SYNC_LIMITS_MS) return
+  const every = (await read($, lim))?.on ? LIM_SYNC_MS : SYNC_LIMITS_MS
+  if (!force && now - limitsSyncedAt < every) return
   limitsSyncedAt = now
+  fiveCheckedAt = now
   try {
     const usage = await $.session.usage()
     if (usage.rateLimits.length > 0) await apply($, usage.rateLimits, usage.context)
@@ -383,7 +399,74 @@ async function apply($: EngineInterface, limits: SessionRateLimit[], context: Se
     cache: previous?.cache ?? lastCache,
   }
   fiveHourNow = next.fiveHour?.percentUsed ?? null
+  fiveCheckedAt = now
   await update($, snap, () => next)
+  // The engine pushes a measure each time the 5h figure moves a point, mid-turn too.
+  await checkLim($, now, next.fiveHour)
+}
+
+// --- lim95 --------------------------------------------------------------------
+
+// Arms the message once the 5-hour limit reaches 95%, once per window: it goes
+// out with the next tool result of the main thread.
+async function checkLim($: EngineInterface, now: number, reading: Limit | null | undefined) {
+  const l = await read($, lim)
+  if (!l?.on || l.pending) return
+  const five = asOf(reading, now)
+  if (!five?.resetsAt || five.percentUsed < LIM_PCT) return
+  // Already told Claude in this window: re-arms once it resets.
+  if (l.firedFor && Date.parse(l.firedFor) > now) return
+  let armed = false
+  await update($, lim, x => {
+    if (!x?.on || x.pending) return x
+    armed = true
+    return { ...x, pending: true }
+  })
+  if (armed) {
+    $.ui.toast(`lim95: 5-hour limit at ${five.percentUsed}%. Claude will be told to pause at its next tool call.`)
+  }
+}
+
+// What Claude reads beside the tool result: the wait counts from now, so it is
+// worked out when the message goes out, not when 95% was reached.
+const limMessage = (pct: number, resetsAt: string, now: number) => {
+  const reset = Date.parse(resetsAt)
+  const left = Math.max(0, reset - now)
+  const secs = Math.ceil((left + LIM_PAD_MS) / 1000)
+  const text =
+    `lim95: the 5-hour usage limit is at ${pct}% and resets at ${clockTime(reset)} (in ${hm(left)}). ` +
+    `Pause work here. Spawn a subagent with a sleep timer for ${secs} seconds ` +
+    `(the time left in the 5-hour limit plus two minutes): its only job is to wait that long ` +
+    `(in shorter chunks if a tool caps how long one wait can run) and then tell you it is done. ` +
+    `Wait for it, and once it tells you it is done, continue the work where you left off.`
+  return { text, secs }
+}
+
+async function toggleLim($: EngineInterface) {
+  const now = await $.clock.now()
+  const was = await read($, lim)
+  await update($, lim, l =>
+    l?.on
+      ? { ...l, on: false, pending: false }
+      : {
+          on: true,
+          pending: false,
+          firedAt: l?.firedAt ?? null,
+          firedPct: l?.firedPct ?? null,
+          // Turning it on arms it again, even in a window it already fired in.
+          firedFor: null,
+          sleepSecs: l?.sleepSecs ?? null,
+          resumeAt: l?.resumeAt ?? null,
+          toolUseId: l?.toolUseId ?? null,
+        },
+  )
+  $.ui.toast(
+    was?.on
+      ? 'lim95 off.'
+      : `lim95 on: at ${LIM_PCT}% of the 5-hour limit, Claude is told to pause and wait out the window plus 2 minutes.`,
+  )
+  // Already past 95%: arm right away.
+  if (!was?.on) await checkLim($, now, (await read($, snap))?.fiveHour)
 }
 
 async function stopWarm($: EngineInterface, reason: string) {
@@ -518,6 +601,7 @@ export const register: Register = on => {
         const current = await read($, snap)
         if (!current) return
         await keepWarm($, current, now)
+        await checkLim($, now, current.fiveHour)
         if (format(current, now) === format(current, current.now)) return
         await update($, snap, s => (s ? { ...s, now } : s))
       })()
@@ -598,6 +682,67 @@ export const register: Register = on => {
     return result
   })
 
+  // lim95: every main-thread tool result re-reads the 5h figure, and once it is
+  // at 95% carries the pause message to Claude in the middle of its turn (a
+  // prompt of the mod's own would wait until the turn ended).
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId || !(await read($, lim))?.on) return result
+    const now = await $.clock.now()
+    let five = (await read($, snap))?.fiveHour ?? null
+    try {
+      const usage = await $.session.usage()
+      five = findLimit(usage.rateLimits, 'five_hour') ?? five
+      fiveCheckedAt = now
+    } catch {
+      // The last reading stands.
+    }
+    await checkLim($, now, five)
+    if (!(await read($, lim))?.pending || result.deny !== undefined) return result
+    const current = asOf(five, now)
+    if (!current?.resetsAt) {
+      // The window reset before the message went out: nothing to wait for.
+      await update($, lim, l => (l ? { ...l, pending: false } : l))
+      return result
+    }
+    const { text, secs } = limMessage(current.percentUsed, current.resetsAt, now)
+    const resumeAt = now + secs * 1000
+    await update($, lim, l =>
+      l
+        ? {
+            ...l,
+            pending: false,
+            firedAt: now,
+            firedPct: current.percentUsed,
+            firedFor: current.resetsAt!,
+            sleepSecs: secs,
+            resumeAt,
+            toolUseId: e.tool_use_id ?? null,
+          }
+        : l,
+    )
+    $.ui.toast(`lim95: told Claude to pause and wait ${hm(secs * 1000)} (until ${clockTime(resumeAt)}).`)
+    return { ...result, context: [...(result.context ?? []), text] }
+  })
+
+  // Marks, under the tool call that carried it, that lim95 told Claude to pause.
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const l = await read($, lim)
+    if (!l?.toolUseId || e.props.tool_use_id !== l.toolUseId) return next(e)
+    const row = await next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const wait = l.sleepSecs !== null ? ` and wait ${hm(l.sleepSecs * 1000)}` : ''
+    const until = l.resumeAt !== null ? ` (until ${clockTime(l.resumeAt)})` : ''
+    return (
+      <Box flexDirection="column">
+        {row}
+        <Text bold>
+          lim95: 5h at {l.firedPct ?? '?'}%, told Claude to pause{wait}{until}, then continue.
+        </Text>
+      </Box>
+    )
+  })
+
   on('session.measure', async ($, e, next) => {
     await apply($, e.rateLimits, e.context)
     return next(e)
@@ -608,6 +753,7 @@ export const register: Register = on => {
     if (e.props.hasSurvey || (await isBandHidden($))) return next(e)
     const current = await read($, snap)
     const isOn = (await read($, warm))?.on ?? false
+    const isLimOn = (await read($, lim))?.on ?? false
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const cols = Math.max(14, e.props.bodyColumns - BUTTONS_COLS)
@@ -639,6 +785,12 @@ export const register: Register = on => {
             label="Warm"
             {...(isOn ? { variant: 'primary' as const } : {})}
             onPress={() => void toggleWarm($)}
+          />
+          <Button
+            key="lim"
+            label={LIM_LABEL}
+            {...(isLimOn ? { variant: 'primary' as const } : {})}
+            onPress={() => void toggleLim($)}
           />
           <Button key="pane" label={PANE_LABEL} onPress={() => void togglePane($)} />
         </Box>
@@ -689,6 +841,44 @@ export const register: Register = on => {
       ? `Last ping: 5h ${cost.before ?? '?'}% → ${cost.after ?? '?'}% (whole percents)`
       : null
 
+    // The 5-hour limit: used, when it resets, and how fresh the reading is.
+    let fiveLine: string | null = null
+    if (fiveHourShown) {
+      const parts = [`5-hour limit: ${fiveHourShown.percentUsed}% used`]
+      if (fiveHourShown.resetsAt) {
+        const reset = Date.parse(fiveHourShown.resetsAt)
+        parts.push(`resets ${clockTime(reset)} (in ${hmss(Math.max(0, reset - now))})`)
+      } else {
+        parts.push('window reset')
+      }
+      if (fiveCheckedAt !== null) parts.push(`checked ${ago(now - fiveCheckedAt)}`)
+      fiveLine = parts.join(' · ')
+    }
+
+    // lim95: armed, about to tell Claude, or waiting out the window.
+    const l = await read($, lim)
+    let limLine = 'lim95: off'
+    if (l?.on) {
+      const firedThisWindow = !!l.firedFor && Date.parse(l.firedFor) > now
+      limLine = l.pending
+        ? `lim95: on · 5h at ${fiveHourShown?.percentUsed ?? '?'}%, telling Claude at its next tool call`
+        : firedThisWindow
+          ? 'lim95: on · told Claude to pause in this window · re-arms when it resets'
+          : `lim95: on · armed at ${LIM_PCT}% · checks the 5h figure every ${LIM_SYNC_MS / 1000}s and at each tool call`
+    }
+    let limLastLine: string | null = null
+    if (l?.firedAt != null) {
+      const parts = [`Last pause: ${clockTime(l.firedAt)} at ${l.firedPct ?? '?'}%`]
+      if (l.resumeAt != null) {
+        parts.push(
+          l.resumeAt > now
+            ? `wait ends ${clockTime(l.resumeAt)} (in ${hmss(l.resumeAt - now)})`
+            : `wait ended ${clockTime(l.resumeAt)}`,
+        )
+      }
+      limLastLine = parts.join(' · ')
+    }
+
     const usage = await paneUsageAt($, now)
     const ctx = usage.context.tokens ?? null
     const ctxLine = ctx === null ? null : `Context: ${k(ctx)}/${k(usage.context.window)}`
@@ -700,13 +890,11 @@ export const register: Register = on => {
         {cache && <Text>Cache: {formatCache(cache, now)}</Text>}
         {lastTurn && <Text>Last turn: {formatLast(lastTurn)}</Text>}
         {compactAt !== null && <Text>Auto-compacts at {k(compactAt)}</Text>}
-        {fiveHourShown && (
-          <Text>
-            5-hour limit: {fiveHourShown.percentUsed}% used{fiveHourShown.resetsAt ? '' : ' (window reset)'}
-          </Text>
-        )}
+        {fiveLine && <Text>{fiveLine}</Text>}
         <Text>{warmLine}</Text>
         {costLine && <Text dimColor>{costLine}</Text>}
+        <Text>{limLine}</Text>
+        {limLastLine && <Text dimColor>{limLastLine}</Text>}
         <Text> </Text>
       </Box>
     )

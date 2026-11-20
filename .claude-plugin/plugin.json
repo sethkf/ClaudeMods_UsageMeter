@@ -1,1 +1,1 @@
-{ "name": "usage-meter", "version": "0.2.0", "description": "Plan limits, reset countdowns, context size and a keep-warm toggle above the prompt", "types": "./types/index.d.ts" }
+{ "name": "usage-meter", "version": "0.3.0", "description": "Plan limits, reset countdowns, context size, a keep-warm toggle and a lim95 pause-at-95% toggle above the prompt", "types": "./types/index.d.ts" }
