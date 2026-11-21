@@ -35,6 +35,25 @@ export type Warm = {
   stopped: string | null
 }
 
+// lim95: once the 5-hour limit reaches 95%, tells Claude (at its next tool
+// call) to pause, wait out the window plus two minutes in a subagent, then go on.
+export type Lim = {
+  on: boolean
+  // 95% was reached; the message goes out with the next tool result.
+  pending: boolean
+  // When it last told Claude to pause, and the 5h figures then.
+  firedAt: number | null
+  firedPct: number | null
+  // The reset time of the window it fired in: it fires once per window, and
+  // re-arms once that time has passed.
+  firedFor: string | null
+  // How long Claude was told to wait, and when that wait ends.
+  sleepSecs: number | null
+  resumeAt: number | null
+  // The tool call whose result carried the message, marked in the transcript.
+  toolUseId: string | null
+}
+
 // Whether the band above the prompt is hidden (it then takes no row at all).
 // Optional: a value an earlier version stored here has no `hidden`.
 export type BandView = { hidden?: boolean }
@@ -44,6 +63,12 @@ export type PaneTick = { at: number }
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-meter': { snap: Snap | null; warm: Warm | null; band: BandView | null; pane: PaneTick | null }
+    'usage-meter': {
+      snap: Snap | null
+      warm: Warm | null
+      lim: Lim | null
+      band: BandView | null
+      pane: PaneTick | null
+    }
   }
 }

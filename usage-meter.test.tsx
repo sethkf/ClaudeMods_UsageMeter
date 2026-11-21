@@ -65,7 +65,7 @@ test('the band spreads 5h, weekly and ctx between hide and the right-hand button
   expect(middle?.props.flexGrow).toBe(1)
   expect(middle?.text).toContain('wk 37%')
   const buttons = (await ui.findAll({ type: 'Button' })).map(b => b.key)
-  expect(buttons).toEqual(['hide', 'warm', 'pane'])
+  expect(buttons).toEqual(['hide', 'warm', 'lim', 'pane'])
   await ui.unmount()
 })
 
@@ -105,7 +105,7 @@ test('hiding the band leaves no row; the right-click menu brings it back', async
   await m.press({ key: 'show-band' })
   await m.unmount()
   await ui.redraw()
-  expect((await ui.findAll({ type: 'Button' })).map(b => b.key)).toEqual(['hide', 'warm', 'pane'])
+  expect((await ui.findAll({ type: 'Button' })).map(b => b.key)).toEqual(['hide', 'warm', 'lim', 'pane'])
   await ui.unmount()
 })
 
@@ -356,4 +356,119 @@ test('keep-warm turns itself off when the cache has already expired', async ($, 
   expect(warm()?.on).toBe(false)
   expect(warm()?.stopped).toBe('the cache had already expired')
   await ui.unmount()
+})
+
+// lim95: a session whose engine reads the 5-hour limit at `pct`, resetting in 133 minutes.
+const limSession = (on: any, pct: number) => {
+  const fiveHour = { percentUsed: pct, resetsAt: SNAP.fiveHour.resetsAt }
+  seed(on, { ...SNAP, fiveHour })
+  const clock = mock.clock(on, { now: NOW })
+  on('session.usage', () => ({
+    value: {
+      context: { tokens: 512_000, window: 1_000_000 },
+      rateLimits: [{ kind: 'five_hour', ...fiveHour }],
+    },
+  }))
+  on('tool.call', () => ({ result: {} }))
+  return clock
+}
+
+test('pressing lim95 fills the button, on desktop and terminal', async ($, on) => {
+  limSession(on, 42)
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount(band(200, surface))
+    expect((await ui.find({ type: 'Button', key: 'lim' }))?.props.variant).toBeUndefined()
+    await ui.press({ key: 'lim' })
+    await ui.redraw()
+    const after = await ui.find({ type: 'Button', key: 'lim' })
+    expect(after?.props.variant).toBe('primary')
+    expect(after?.props.label).toBe('lim95')
+    await ui.press({ key: 'lim' })
+    await ui.unmount()
+  }
+})
+
+test('at 95% lim95 tells Claude once, with the next tool result, to pause and wait out the window + 2m', async ($, on) => {
+  limSession(on, 96)
+  const ui = await $.ui.mount(band(200))
+  await ui.press({ key: 'lim' })
+
+  // A subagent's tool call carries nothing.
+  const sub: any = await $.tool.call({ tool: 'Bash', command: 'sleep 1', agentId: 'a1' } as any)
+  expect(sub.context ?? []).toHaveLength(0)
+
+  const first: any = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(first.context).toHaveLength(1)
+  const text: string = first.context[0]
+  // 133 minutes left plus 2: 8100 seconds.
+  expect(text).toContain('Pause work here.')
+  expect(text).toContain('sleep timer for 8100 seconds')
+  expect(text).toContain('continue the work where you left off')
+
+  // Once per window.
+  const second: any = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(second.context ?? []).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('below 95%, tool results carry nothing', async ($, on) => {
+  limSession(on, 94)
+  const ui = await $.ui.mount(band(200))
+  await ui.press({ key: 'lim' })
+  const below: any = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(below.context ?? []).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('with lim95 off, 96% carries nothing', async ($, on) => {
+  limSession(on, 96)
+  const off: any = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(off.context ?? []).toHaveLength(0)
+})
+
+test('the pane shows lim95 armed, then the pause and when the wait ends', async ($, on) => {
+  limSession(on, 96)
+  const band0 = await $.ui.mount(band(200))
+  await band0.press({ key: 'lim' })
+  const pane = await $.ui.mount({
+    plugin: 'usage-meter',
+    component: 'Pane',
+    requestId: 'usage-meter',
+    surface: 'desktop',
+    props: {},
+  } as any)
+  expect((await pane.find({ type: 'Text', text: /^lim95:/ }))?.text).toMatch(/telling Claude at its next tool call/)
+  expect((await pane.find({ type: 'Text', text: /^5-hour limit:/ }))?.text).toMatch(
+    /^5-hour limit: 96% used · resets 14:13z \(in 2:13:00\)/,
+  )
+
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await pane.redraw()
+  expect((await pane.find({ type: 'Text', text: /^lim95:/ }))?.text).toMatch(/told Claude to pause in this window/)
+  expect((await pane.find({ type: 'Text', text: /^Last pause:/ }))?.text).toBe(
+    'Last pause: 12:00z at 96% · wait ends 14:15z (in 2:15:00)',
+  )
+  await pane.unmount()
+  await band0.unmount()
+})
+
+test('the tool call that carried the message is marked in the transcript', async ($, on) => {
+  limSession(on, 96)
+  const b = await $.ui.mount(band(200))
+  await b.press({ key: 'lim' })
+  await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: 'tu-1' } as any)
+  for (const id of ['tu-1', 'tu-2']) {
+    const row = await $.ui.mount({
+      plugin: 'usage-meter',
+      component: 'ToolUse',
+      requestId: id,
+      surface: 'desktop',
+      props: { tool_use_id: id, tool: 'Bash', input: { command: 'ls' }, isRunning: false, isErrored: false, isInterrupted: false },
+    } as any)
+    const note = await row.find({ type: 'Text', text: /^lim95:/ })
+    if (id === 'tu-1') expect(note?.text).toBe('lim95: 5h at 96%, told Claude to pause and wait 2h15m (until 14:15z), then continue.')
+    else expect(note).toBeUndefined()
+    await row.unmount()
+  }
+  await b.unmount()
 })
